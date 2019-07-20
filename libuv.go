@@ -53,7 +53,8 @@ func (pd *pollDesc) read() error {
 				return err
 			}
 		}
-		if done {
+
+		if done || (n == 0 && sum == 0) {
 			break
 		}
 
@@ -143,7 +144,9 @@ func (pd *pollDesc) GetAddr() string {
 	var addr string
 	switch sa := pd.sa.(type) {
 	case *syscall.SockaddrInet4:
-		addr = net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3]).String()
+		ip := net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3]).String()
+		port := sa.Port
+		addr = fmt.Sprintf("%s:%d", ip, port)
 	case *syscall.SockaddrInet6:
 	case *syscall.SockaddrUnix:
 	default:
@@ -179,6 +182,7 @@ func Wait() {
 		for i := 0; i < n; i++ {
 			e := events[i]
 			if e.Events == 0 {
+				log.Println("wait continue")
 				continue
 			}
 
@@ -208,7 +212,7 @@ func Wait() {
 
 // Start 启动
 func Start(address string, onAccept func(Conn)) {
-	listenfd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.O_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
+	listenfd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
 		log.Println(err)
 		os.Exit(1)

@@ -16,7 +16,7 @@ func onRead(conn libuv.Conn, buf []byte, n int) {
 
 	// 业务逻辑
 	if n == 0 { // 客户端关闭连接
-		log.Println("client close")
+		log.Printf("%s close", conn.GetAddr())
 		conn.Close()
 		return
 	}

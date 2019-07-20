@@ -304,6 +304,9 @@ func accept(epfd int, e syscall.EpollEvent) {
 
 func read(epfd int, e syscall.EpollEvent) error {
 	pd := *(**pollDesc)(unsafe.Pointer(&e.Fd))
+
+	// 这里有问题，如果连接来了，用户协议是先写那么就没有配读缓存及读回调
+	// 然后就会丢失客户端的关闭连接
 	if len(pd.bufr) == 0 {
 		log.Println("empty buf")
 		return nil

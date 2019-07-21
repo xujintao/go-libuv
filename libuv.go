@@ -11,28 +11,27 @@ import (
 )
 
 type Conn interface {
-	Read(func(Conn, []byte, int), []byte) error
-	Write(func(Conn), []byte) error
+	Read([]byte) error
+	Write([]byte) error
 	Close()
-	GetAddr() string
+	GetLocalAddr() string
+	GetRemoteAddr() string
 }
 
 type pollDesc struct {
 	listenfd   int
 	islistener bool
-	cbAccept   func(Conn)
 	fd         int
-	cbRead     func(Conn, []byte, int)
 	bufr       []byte
-	cbWrite    func(Conn)
 	bufw       []byte
-	sa         syscall.Sockaddr
+	lsa        syscall.Sockaddr
+	rsa        syscall.Sockaddr
+	handler    Handler
 }
 
 func (pd *pollDesc) read() error {
 	fd := pd.fd
 	buf := pd.bufr
-	cbRead := pd.cbRead
 
 	// 循环读是担心待接收的数据量太大，读到EAGAIN才算完事
 	done := false
@@ -68,15 +67,14 @@ func (pd *pollDesc) read() error {
 	}
 
 	pd.bufr = buf
-	cbRead(Conn(pd), buf, sum)
+	pd.handler.OnRead(Conn(pd), buf, sum)
 	return nil
 }
 
-func (pd *pollDesc) Read(cbRead func(Conn, []byte, int), buf []byte) error {
+func (pd *pollDesc) Read(buf []byte) error {
 	if len(buf) == 0 {
 		return errors.New("empty buf")
 	}
-	pd.cbRead = cbRead
 	pd.bufr = buf
 	return pd.read()
 }
@@ -84,7 +82,6 @@ func (pd *pollDesc) Read(cbRead func(Conn, []byte, int), buf []byte) error {
 func (pd *pollDesc) write() error {
 	fd := pd.fd
 	buf := pd.bufw
-	cbWrite := pd.cbWrite
 
 	// 循环写的原因担心待发送的数据量太大，先触发EAGAIN，再分批发送
 	for {
@@ -108,16 +105,15 @@ func (pd *pollDesc) write() error {
 		}
 	}
 
-	cbWrite(Conn(pd))
+	pd.handler.OnWrite(Conn(pd))
 	pd.bufw = buf[:0]
 	return nil
 }
 
-func (pd *pollDesc) Write(cbWrite func(Conn), buf []byte) error {
+func (pd *pollDesc) Write(buf []byte) error {
 	if len(buf) == 0 {
 		return errors.New("nothing to write")
 	}
-	pd.cbWrite = cbWrite
 
 	// 直接赋值会有问题，比如上一个事务的数据还没写完而本次事务又有数据需要写，会覆盖
 	pd.bufw = append(pd.bufw, buf...)
@@ -139,10 +135,18 @@ func (pd *pollDesc) Close() {
 	}
 }
 
-func (pd *pollDesc) GetAddr() string {
+func (pd *pollDesc) GetLocalAddr() string {
+	return getAddr(pd.lsa)
+}
+
+func (pd *pollDesc) GetRemoteAddr() string {
+	return getAddr(pd.rsa)
+}
+
+func getAddr(sa syscall.Sockaddr) string {
 
 	var addr string
-	switch sa := pd.sa.(type) {
+	switch sa := sa.(type) {
 	case *syscall.SockaddrInet4:
 		ip := net.IPv4(sa.Addr[0], sa.Addr[1], sa.Addr[2], sa.Addr[3]).String()
 		port := sa.Port
@@ -166,7 +170,6 @@ func init() {
 		log.Println(err)
 		os.Exit(1)
 	}
-
 }
 
 func Wait() {
@@ -211,7 +214,7 @@ func Wait() {
 }
 
 // Start 启动
-func Start(address string, onAccept func(Conn)) {
+func Start(address string, handler Handler) {
 	listenfd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
 		log.Println(err)
@@ -242,7 +245,8 @@ func Start(address string, onAccept func(Conn)) {
 	pd := pollDesc{
 		listenfd:   listenfd,
 		islistener: true,
-		cbAccept:   onAccept,
+		lsa:        &addr,
+		handler:    handler,
 	}
 	var event syscall.EpollEvent
 	*(**pollDesc)(unsafe.Pointer(&event.Fd)) = &pd
@@ -285,8 +289,10 @@ func accept(epfd int, e syscall.EpollEvent) {
 		// 小不了
 
 		cpd := pollDesc{
-			fd: connfd,
-			sa: sa,
+			fd:      connfd,
+			lsa:     lpd.lsa,
+			rsa:     sa,
+			handler: lpd.handler,
 		}
 
 		var event syscall.EpollEvent
@@ -298,7 +304,7 @@ func accept(epfd int, e syscall.EpollEvent) {
 		}
 
 		// 回调用户代码
-		lpd.cbAccept(Conn(&cpd))
+		lpd.handler.OnAccept(Conn(&cpd))
 	}
 }
 

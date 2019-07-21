@@ -10,6 +10,11 @@ import (
 	"unsafe"
 )
 
+type Listener interface {
+	Accept() error
+	Close()
+}
+
 type Conn interface {
 	Read([]byte) error
 	Write([]byte) error
@@ -143,6 +148,60 @@ func (pd *pollDesc) GetRemoteAddr() string {
 	return getAddr(pd.rsa)
 }
 
+func (pd *pollDesc) accept() error {
+	fd := pd.listenfd
+
+	done := false
+	cnt := 0
+	for {
+		connfd, sa, err := syscall.Accept4(fd, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
+		if connfd == -1 {
+			switch err {
+			case syscall.EAGAIN:
+				if cnt == 0 {
+					uvlog.Print("connect not yet")
+					return nil
+				}
+				done = true
+
+			default:
+				uvlog.Print(err)
+				return err
+			}
+		}
+
+		if done {
+			uvlog.Printf("we have processed %d incoming conn", cnt)
+			break
+		}
+
+		cnt++
+
+		cpd := pollDesc{
+			fd:      connfd,
+			lsa:     pd.lsa,
+			rsa:     sa,
+			handler: pd.handler,
+		}
+
+		var event syscall.EpollEvent
+		*(**pollDesc)(unsafe.Pointer(&event.Fd)) = &cpd
+		event.Events = syscall.EPOLLIN | syscall.EPOLLOUT | syscall.EPOLLRDHUP | (-syscall.EPOLLET)
+		if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, connfd, &event); err != nil {
+			uvlog.Print(err)
+			os.Exit(1)
+		}
+
+		// 回调用户代码
+		pd.handler.OnAccept(Conn(&cpd))
+	}
+	return nil
+}
+
+func (pd *pollDesc) Accept() error {
+	return pd.accept()
+}
+
 func getAddr(sa syscall.Sockaddr) string {
 
 	var addr string
@@ -263,58 +322,9 @@ func Start(address string, handler Handler) {
 	}
 }
 
-func accept(epfd int, e syscall.EpollEvent) {
+func accept(epfd int, e syscall.EpollEvent) error {
 	lpd := *(**pollDesc)(unsafe.Pointer(&e.Fd))
-	listenfd := lpd.listenfd
-
-	cnt := 0
-	for {
-		connfd, sa, err := syscall.Accept4(listenfd, syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC)
-		if connfd == -1 {
-			switch err {
-			case syscall.EAGAIN:
-				uvlog.Printf("we have processed %d incoming conn", cnt)
-			default:
-				uvlog.Print(err)
-			}
-			return
-		}
-		cnt++
-
-		// v, err := syscall.GetsockoptInt(connfd, syscall.SOL_SOCKET, syscall.SO_SNDBUF)
-		// if err != nil {
-		// 	return
-		// }
-		// // 把发送缓存设小，用于测试
-		// if err := syscall.SetsockoptInt(connfd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, 40); err != nil {
-		// 	log.Println(err)
-		// 	return
-		// }
-		// v, err = syscall.GetsockoptInt(connfd, syscall.SOL_SOCKET, syscall.SO_SNDBUF)
-		// if err != nil {
-		// 	return
-		// }
-		// _ = v
-		// 小不了
-
-		cpd := pollDesc{
-			fd:      connfd,
-			lsa:     lpd.lsa,
-			rsa:     sa,
-			handler: lpd.handler,
-		}
-
-		var event syscall.EpollEvent
-		*(**pollDesc)(unsafe.Pointer(&event.Fd)) = &cpd
-		event.Events = syscall.EPOLLIN | syscall.EPOLLOUT | syscall.EPOLLRDHUP | (-syscall.EPOLLET)
-		if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, connfd, &event); err != nil {
-			uvlog.Print(err)
-			os.Exit(1)
-		}
-
-		// 回调用户代码
-		lpd.handler.OnAccept(Conn(&cpd))
-	}
+	return lpd.accept()
 }
 
 func read(epfd int, e syscall.EpollEvent) error {

@@ -4,11 +4,32 @@
 对于自己打开的fd，也是先包装一下，然后internal/poll.FD统一使用异步复用方式进行io，golang使用协程把它模拟成阻塞方式  
 ```
 listener/conn-----net.(*netFD)-------
-                                     |-------internal/poll.(*FD)--------runtime跨平台支持poll
+                                     |-------internal/poll.(*FD)----------runtime跨平台支持poll
                   os.(*file) --------        (支持blocking和poll)
 ```
 
 ## libuv事件驱动异步io复用模型
 ```
-listener/conn--------------------------------libuv(原则上也应该支持跨平台，现在只支持linux)
+listener/conn------net.(*netFD)------
+                                     |--------go-libuv/poll.(*PollDesc)---不需要runtime支持
+                   os.(*file)--------         (现在只支持linux)
+                   (not yet)
+```
+
+#### usage
+```
+package main
+
+import (
+	"log"
+
+	"github.com/xujintao/go-libuv/net/http"
+	"github.com/xujintao/go-libuv/poll"
+)
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	http.ListenAndServe(":8080")
+	poll.Wait()
+}
 ```

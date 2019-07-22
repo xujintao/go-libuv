@@ -10,5 +10,5 @@ listener/conn-----net.(*netFD)-------
 
 ## libuv事件驱动异步io复用模型
 ```
-listener/conn--------libuv(原则上也应该支持跨平台，现在只支持linux)
+listener/conn--------------------------------libuv(原则上也应该支持跨平台，现在只支持linux)
 ```

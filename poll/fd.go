@@ -1,4 +1,4 @@
-package libuv
+package poll
 
 import (
 	"errors"
@@ -10,32 +10,28 @@ import (
 	"unsafe"
 )
 
-type Listener interface {
-	Accept() error
-	Close()
+type PollDesc struct {
+	Sysfd    int
+	bufr     []byte
+	bufw     []byte
+	OnAccept func(int, syscall.Sockaddr)
+	OnRead   func([]byte, int)
+	OnWrite  func([]byte, int)
 }
 
-type Conn interface {
-	Read([]byte) error
-	Write([]byte) error
-	Close()
-	GetLocalAddr() string
-	GetRemoteAddr() string
+func (pd *PollDesc) Init() error {
+	var event syscall.EpollEvent
+	*(**PollDesc)(unsafe.Pointer(&event.Fd)) = pd
+	event.Events = syscall.EPOLLIN | syscall.EPOLLOUT | syscall.EPOLLRDHUP | (-syscall.EPOLLET)
+	if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, pd.Sysfd, &event); err != nil {
+		uvlog.Println(err)
+		return err
+	}
+	return nil
 }
 
-type pollDesc struct {
-	listenfd   int
-	islistener bool
-	fd         int
-	bufr       []byte
-	bufw       []byte
-	lsa        syscall.Sockaddr
-	rsa        syscall.Sockaddr
-	handler    Handler
-}
-
-func (pd *pollDesc) read() error {
-	fd := pd.fd
+func (pd *PollDesc) read() error {
+	fd := pd.Sysfd
 	buf := pd.bufr
 
 	// 循环读是担心待接收的数据量太大，读到EAGAIN才算完事
@@ -72,20 +68,21 @@ func (pd *pollDesc) read() error {
 	}
 
 	pd.bufr = buf
-	pd.handler.OnRead(Conn(pd), buf, sum)
+	pd.OnRead(pd.bufr, sum)
 	return nil
 }
 
-func (pd *pollDesc) Read(buf []byte) error {
+func (pd *PollDesc) Read(buf []byte, handle func([]byte, int)) error {
 	if len(buf) == 0 {
 		return errors.New("empty buf")
 	}
 	pd.bufr = buf
+	pd.OnRead = handle
 	return pd.read()
 }
 
-func (pd *pollDesc) write() error {
-	fd := pd.fd
+func (pd *PollDesc) write() error {
+	fd := pd.Sysfd
 	buf := pd.bufw
 
 	// 循环写的原因担心待发送的数据量太大，先触发EAGAIN，再分批发送
@@ -110,46 +107,41 @@ func (pd *pollDesc) write() error {
 		}
 	}
 
-	pd.handler.OnWrite(Conn(pd))
+	// pd.Handler.OnWrite(sum)
+	pd.OnWrite(pd.bufw, 50)
 	pd.bufw = buf[:0]
 	return nil
 }
 
-func (pd *pollDesc) Write(buf []byte) error {
+func (pd *PollDesc) Write(buf []byte, handle func([]byte, int)) error {
 	if len(buf) == 0 {
 		return errors.New("nothing to write")
 	}
 
 	// 直接赋值会有问题，比如上一个事务的数据还没写完而本次事务又有数据需要写，会覆盖
 	pd.bufw = append(pd.bufw, buf...)
+	pd.OnWrite = handle
 	return pd.write()
 }
 
-func (pd *pollDesc) Close() {
+func (pd *PollDesc) Close() error {
 	// 删除io监听
 	var event syscall.EpollEvent
-	if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_DEL, pd.fd, &event); err != nil {
+	if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_DEL, pd.Sysfd, &event); err != nil {
 		uvlog.Print(err)
-		return
+		return err
 	}
 
 	// 主动关闭连接
-	if err := syscall.Close(pd.fd); err != nil {
+	if err := syscall.Close(pd.Sysfd); err != nil {
 		uvlog.Print(err)
-		return
+		return err
 	}
+	return nil
 }
 
-func (pd *pollDesc) GetLocalAddr() string {
-	return getAddr(pd.lsa)
-}
-
-func (pd *pollDesc) GetRemoteAddr() string {
-	return getAddr(pd.rsa)
-}
-
-func (pd *pollDesc) accept() error {
-	fd := pd.listenfd
+func (pd *PollDesc) accept() error {
+	fd := pd.Sysfd
 
 	done := false
 	cnt := 0
@@ -177,28 +169,16 @@ func (pd *pollDesc) accept() error {
 
 		cnt++
 
-		cpd := pollDesc{
-			fd:      connfd,
-			lsa:     pd.lsa,
-			rsa:     sa,
-			handler: pd.handler,
-		}
-
-		var event syscall.EpollEvent
-		*(**pollDesc)(unsafe.Pointer(&event.Fd)) = &cpd
-		event.Events = syscall.EPOLLIN | syscall.EPOLLOUT | syscall.EPOLLRDHUP | (-syscall.EPOLLET)
-		if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, connfd, &event); err != nil {
-			uvlog.Print(err)
-			os.Exit(1)
-		}
-
 		// 回调用户代码
-		pd.handler.OnAccept(Conn(&cpd))
+		pd.OnAccept(connfd, sa)
 	}
 	return nil
 }
 
-func (pd *pollDesc) Accept() error {
+func (pd *PollDesc) Accept(handle func(int, syscall.Sockaddr)) error {
+	// 调用的时候，也是回调函数压栈的过程
+	// 保存了回调函数栈头，出栈的过程正好也是回调流的过程，相当完美
+	pd.OnAccept = handle
 	return pd.accept()
 }
 
@@ -251,15 +231,15 @@ func Wait() {
 
 			if e.Events&(syscall.EPOLLERR|syscall.EPOLLHUP) != 0 {
 				uvlog.Println(e.Events)
-				pd := *(**pollDesc)(unsafe.Pointer(&e.Fd))
+				pd := *(**PollDesc)(unsafe.Pointer(&e.Fd))
 				pd.Close()
 				continue
 			}
 
 			switch {
 			case e.Events&syscall.EPOLLIN != 0:
-				pd := *(**pollDesc)(unsafe.Pointer(&e.Fd))
-				if pd.islistener {
+				pd := *(**PollDesc)(unsafe.Pointer(&e.Fd))
+				if pd.OnAccept != nil {
 					uvlog.Println("accept event active------>")
 					accept(epfd, e)
 					uvlog.Println("------>accept event deprecated")
@@ -280,55 +260,20 @@ func Wait() {
 }
 
 // Start 启动
-func Start(address string, handler Handler) {
-	listenfd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_NONBLOCK|syscall.SOCK_CLOEXEC, 0)
-	if err != nil {
-		uvlog.Println(err)
-		os.Exit(1)
-	}
+// func Start(address string, handler Handler) {
 
-	// 只有listenfd需要设置
-	if err := syscall.SetsockoptInt(listenfd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
-		uvlog.Println(err)
-		os.Exit(1)
-	}
+// 	uvlog.Println("uv start")
 
-	addr := syscall.SockaddrInet4{Port: 8080}
-	copy(addr.Addr[:], net.ParseIP("0.0.0.0").To4())
-	if err := syscall.Bind(listenfd, &addr); err != nil {
-		uvlog.Println(err)
-		os.Exit(1)
-	}
-
-	if err := syscall.Listen(listenfd, 128); err != nil {
-		uvlog.Println(err)
-		os.Exit(1)
-	}
-
-	uvlog.Println("uv start")
-
-	pd := pollDesc{
-		listenfd:   listenfd,
-		islistener: true,
-		lsa:        &addr,
-		handler:    handler,
-	}
-	var event syscall.EpollEvent
-	*(**pollDesc)(unsafe.Pointer(&event.Fd)) = &pd
-	event.Events = syscall.EPOLLIN | syscall.EPOLLOUT | syscall.EPOLLRDHUP | (-syscall.EPOLLET)
-	if err := syscall.EpollCtl(epfd, syscall.EPOLL_CTL_ADD, listenfd, &event); err != nil {
-		uvlog.Println(err)
-		os.Exit(1)
-	}
-}
+// 	// pd.Accept()
+// }
 
 func accept(epfd int, e syscall.EpollEvent) error {
-	lpd := *(**pollDesc)(unsafe.Pointer(&e.Fd))
+	lpd := *(**PollDesc)(unsafe.Pointer(&e.Fd))
 	return lpd.accept()
 }
 
 func read(epfd int, e syscall.EpollEvent) error {
-	pd := *(**pollDesc)(unsafe.Pointer(&e.Fd))
+	pd := *(**PollDesc)(unsafe.Pointer(&e.Fd))
 
 	// 这里有问题，如果连接来了，用户协议是先写那么就没有配读缓存及读回调
 	// 然后就会丢失客户端的关闭连接
@@ -340,7 +285,7 @@ func read(epfd int, e syscall.EpollEvent) error {
 }
 
 func write(epfd int, e syscall.EpollEvent) error {
-	pd := *(**pollDesc)(unsafe.Pointer(&e.Fd))
+	pd := *(**PollDesc)(unsafe.Pointer(&e.Fd))
 	if len(pd.bufw) == 0 {
 		uvlog.Print("nothing to write")
 		return nil

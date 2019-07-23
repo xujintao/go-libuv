@@ -14,6 +14,7 @@ type PollDesc struct {
 	Sysfd    int
 	bufr     []byte
 	bufw     []byte
+	w        int
 	OnAccept func(int, syscall.Sockaddr)
 	OnRead   func([]byte, int)
 	OnWrite  func([]byte, int)
@@ -84,6 +85,7 @@ func (pd *PollDesc) Read(buf []byte, handle func([]byte, int)) error {
 func (pd *PollDesc) write() error {
 	fd := pd.Sysfd
 	buf := pd.bufw
+	w := pd.w
 
 	// 循环写的原因担心待发送的数据量太大，先触发EAGAIN，再分批发送
 	for {
@@ -93,6 +95,7 @@ func (pd *PollDesc) write() error {
 			case syscall.EAGAIN:
 				uvlog.Print("fd not ready for writing")
 				pd.bufw = buf
+				pd.w = w
 				return nil
 			default:
 				uvlog.Println(err)
@@ -102,14 +105,14 @@ func (pd *PollDesc) write() error {
 
 		uvlog.Printf("write bytes %d", n)
 		buf = buf[n:] // 切
+		w += n
 		if 0 == len(buf) {
 			break
 		}
 	}
 
-	// pd.Handler.OnWrite(sum)
-	pd.OnWrite(pd.bufw, 50)
-	pd.bufw = buf[:0]
+	pd.bufw = buf
+	pd.OnWrite(buf, w)
 	return nil
 }
 
@@ -119,7 +122,10 @@ func (pd *PollDesc) Write(buf []byte, handle func([]byte, int)) error {
 	}
 
 	// 直接赋值会有问题，比如上一个事务的数据还没写完而本次事务又有数据需要写，会覆盖
-	pd.bufw = append(pd.bufw, buf...)
+	// pd.bufw = append(pd.bufw, buf...)
+	// 哦，没有问题，单线程情况下本次事务没写完就不会触发写回调，下一个事务自然就不会开始
+	pd.bufw = buf
+	pd.w = 0
 	pd.OnWrite = handle
 	return pd.write()
 }

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"syscall"
 	"unsafe"
 )
@@ -44,7 +45,7 @@ func (pd *PollDesc) read() error {
 			switch err {
 			case syscall.EAGAIN:
 				if sum == 0 { // fd还没就绪
-					uvlog.Print("fd not ready for reading")
+					uvlog.Print("fd not ready for reading:", CallerFuncNamesf(1, 50))
 					pd.bufr = buf
 					return nil
 				}
@@ -93,7 +94,7 @@ func (pd *PollDesc) write() error {
 		if n == -1 {
 			switch err {
 			case syscall.EAGAIN:
-				uvlog.Print("fd not ready for writing")
+				uvlog.Print("fd not ready for writing:", CallerFuncNamesf(1, 50))
 				pd.bufw = buf
 				pd.w = w
 				return nil
@@ -103,7 +104,6 @@ func (pd *PollDesc) write() error {
 			}
 		}
 
-		uvlog.Printf("write bytes %d", n)
 		buf = buf[n:] // 切
 		w += n
 		if 0 == len(buf) {
@@ -157,7 +157,7 @@ func (pd *PollDesc) accept() error {
 			switch err {
 			case syscall.EAGAIN:
 				if cnt == 0 {
-					uvlog.Print("connect not yet")
+					uvlog.Print("server start success, connections not yet coming")
 					return nil
 				}
 				done = true
@@ -213,8 +213,7 @@ func init() {
 	var err error
 	epfd, err = syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
 	if err != nil {
-		uvlog.Println(err)
-		os.Exit(1)
+		panic(err)
 	}
 }
 
@@ -246,18 +245,12 @@ func Wait() {
 			case e.Events&syscall.EPOLLIN != 0:
 				pd := *(**PollDesc)(unsafe.Pointer(&e.Fd))
 				if pd.OnAccept != nil {
-					uvlog.Println("accept event active------>")
 					accept(epfd, e)
-					uvlog.Println("------>accept event deprecated")
 					break
 				}
-				uvlog.Println("read event active------>")
 				read(epfd, e)
-				uvlog.Println("------>read event deprecated")
 			case e.Events&syscall.EPOLLOUT != 0:
-				uvlog.Println("write event active------>")
 				write(epfd, e)
-				uvlog.Println("------>write event deprecated")
 			default:
 				uvlog.Printf("poll continue, event(%v)", e)
 			}
@@ -297,4 +290,47 @@ func write(epfd int, e syscall.EpollEvent) error {
 		return nil
 	}
 	return pd.write()
+}
+
+// Callers reports file and line number information about function invocations on
+// the calling goroutine's stack. The argument skip is the number of stack frames
+// to ascend, with 0 identifying the caller of Callers.
+func Callers(skip, sum int) (frames []*runtime.Frame) {
+	rpc := make([]uintptr, sum)
+	n := runtime.Callers(skip+1, rpc)
+	if n < 1 {
+		return
+	}
+	i := 0
+	for {
+		frame, more := runtime.CallersFrames(rpc[i:]).Next()
+		frames = append(frames, &frame)
+		i++
+		if !more {
+			break
+		}
+	}
+	return
+}
+
+// CallerFuncNames reports function name information about function invocations on
+// the calling goroutine's stack. The argument skip is the number of stack frames
+// to ascend, with 0 identifying the caller of Caller.
+func CallerFuncNames(skip, sum int) (names []string) {
+	frames := Callers(skip+1, sum)
+	for _, frame := range frames {
+		name := frame.Function
+		names = append(names, name)
+	}
+	return
+}
+
+// CallerFuncNamesf return function names with \r\n
+func CallerFuncNamesf(skip, sum int) (namesf string) {
+	names := CallerFuncNames(skip+1, sum)
+	namesf = "\n"
+	for _, name := range names {
+		namesf += name + "\n"
+	}
+	return
 }

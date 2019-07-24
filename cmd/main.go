@@ -17,6 +17,9 @@ import (
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	http.ListenAndServe(":8080")
+	if err := http.ListenAndServe(":8080"); err != nil {
+		log.Print(err)
+		return
+	}
 	poll.Wait()
 }

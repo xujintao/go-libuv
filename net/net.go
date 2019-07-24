@@ -1,6 +1,8 @@
 package net
 
 import (
+	"errors"
+	"fmt"
 	"syscall"
 )
 
@@ -58,3 +60,8 @@ func (c *conn) RemoteAddr() syscall.Sockaddr {
 }
 
 type PacketConn interface{}
+
+func Errorf(format string, e ...interface{}) error {
+	errstr := fmt.Sprintf(format, e...)
+	return errors.New(errstr)
+}

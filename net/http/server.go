@@ -54,8 +54,6 @@ func (c *conn) serve() error {
 
 type Server struct {
 	Addr string
-	bufr []byte
-	bufw []byte
 }
 
 func (srv *Server) newConn(rwc net.Conn) *conn {
